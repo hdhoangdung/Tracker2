@@ -17,14 +17,30 @@ const OPF         = 'https://world.openproductsfacts.org/api/v0/product';
 const UPC_DB      = 'https://api.upcitemdb.com/prod/trial/lookup';
 const GO_UPC      = 'https://go-upc.com/api/v1/code';
 
+/** Parse a date string from Open Food Facts (formats: YYYY-MM-DD, DD/MM/YYYY, YYYYMMDD) */
+function parseOFFDate(raw) {
+  if (!raw) return '';
+  const s = String(raw).trim();
+  // YYYY-MM-DD
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) return s;
+  // DD/MM/YYYY
+  const dmy = s.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (dmy) return `${dmy[3]}-${dmy[2]}-${dmy[1]}`;
+  // YYYYMMDD
+  if (/^\d{8}$/.test(s)) return `${s.slice(0,4)}-${s.slice(4,6)}-${s.slice(6,8)}`;
+  return '';
+}
+
 /** Normalise an Open*Facts product response into our shape */
 function fromOFF(p) {
   return {
     found: true,
-    name:     p.product_name_vi || p.product_name || p.product_name_en || p.abbreviated_product_name || '',
-    brand:    p.brands || '',
-    imageUrl: p.image_front_url || p.image_url || '',
-    category: p.categories_tags?.[0]?.replace(/^[a-z]{2}:/, '') || '',
+    name:            p.product_name_vi || p.product_name || p.product_name_en || p.abbreviated_product_name || '',
+    brand:           p.brands || '',
+    imageUrl:        p.image_front_url || p.image_url || '',
+    category:        p.categories_tags?.[0]?.replace(/^[a-z]{2}:/, '') || '',
+    manufactureDate: parseOFFDate(p.manufacturing_date || p.created_t ? '' : ''),
+    expiryDate:      parseOFFDate(p.expiration_date || p['expiry-date'] || ''),
   };
 }
 
