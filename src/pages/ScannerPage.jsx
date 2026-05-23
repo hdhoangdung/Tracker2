@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { BrowserMultiFormatReader, NotFoundException } from '@zxing/browser';
+import { BrowserMultiFormatReader } from '@zxing/browser';
 import {
   ArrowLeft, Flashlight, Keyboard, Loader2, CheckCircle, XCircle, Package, AlertCircle
 } from 'lucide-react';
