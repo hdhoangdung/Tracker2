@@ -1,13 +1,17 @@
 /**
  * ScannerPage – optimised for iPhone 11 Pro Max / iOS Safari
  *
- * Key decisions:
- * - Use facingMode: 'environment' directly (iOS enumerateDevices returns empty labels before permission)
- * - Crop canvas to the scan-box region only (saves ~80% ZBar work vs full frame)
- * - Scan every 150 ms — fast enough, avoids thermal throttling on iPhone
- * - No `advanced` constraints on iOS (torch / focusMode throw OverconstrainedError)
- * - Parse GS1 Application Identifiers from barcode data to extract dates
- * - `playsInline` + no `muted` required for iOS autoplay
+ * Scanning strategy (fastest first):
+ * 1. BarcodeDetector Web API  — iOS 17+ / Safari calls into VisionKit natively.
+ *    This is the same engine as the Camera app. Sub-100ms detection.
+ * 2. ZBar WASM fallback        — for Android Chrome and older iOS.
+ *
+ * Other iOS-specific decisions:
+ * - facingMode: 'environment' directly (enumerateDevices labels are empty before permission)
+ * - No `advanced` constraints (torch/focusMode throw OverconstrainedError on iOS)
+ * - Crop canvas to scan-box region only (saves ~80% ZBar work)
+ * - `playsInline` + `muted` required for iOS autoplay
+ * - height: 100dvh avoids Safari address-bar overlap
  */
 
 import { useEffect, useRef, useState, useCallback } from 'react';
@@ -17,9 +21,26 @@ import { useProducts } from '../context/ProductContext';
 
 const STEPS = { SCAN: 'scan', LOOKUP: 'lookup', FORM: 'form', SUCCESS: 'success' };
 
-// ─── ZBar WASM (lazy-loaded) ──────────────────────────────────────────────────
+// ─── BarcodeDetector (Web API → VisionKit on iOS) ─────────────────────────────
+const hasBarcodeDetector = typeof window !== 'undefined' && 'BarcodeDetector' in window;
+
+// All formats supported by BarcodeDetector / VisionKit
+const BD_FORMATS = [
+  'aztec','code_128','code_39','code_93','codabar','data_matrix',
+  'ean_13','ean_8','itf','pdf417','qr_code','upc_a','upc_e',
+];
+
+let _barcodeDetector = null;
+function getBarcodeDetector() {
+  if (_barcodeDetector) return _barcodeDetector;
+  // eslint-disable-next-line no-undef
+  _barcodeDetector = new BarcodeDetector({ formats: BD_FORMATS });
+  return _barcodeDetector;
+}
+
+// ─── ZBar WASM fallback (lazy-loaded) ────────────────────────────────────────
 let _scanImageData = null;
-async function getScan() {
+async function getZBarScan() {
   if (_scanImageData) return _scanImageData;
   const mod = await import('@undecaf/zbar-wasm');
   _scanImageData = mod.scanImageData;
@@ -113,46 +134,57 @@ export function ScannerPage({ onBack, onNavigate }) {
         video.setAttribute('muted', '');
         await video.play().catch(() => {});
 
-        const scanFn = await getScan();
         const canvas = canvasRef.current;
         const ctx    = canvas.getContext('2d', { willReadFrequently: true });
 
+        // Pre-load ZBar only if BarcodeDetector is unavailable
+        const zbarScan = hasBarcodeDetector ? null : await getZBarScan();
+        const detector = hasBarcodeDetector ? getBarcodeDetector() : null;
+
         // ── Scan tick ──────────────────────────────────────────────────────
-        // We only scan the centre crop (the visible scan box) to reduce work.
         const tick = async () => {
           if (cancelled || !activeRef.current) return;
-          if (video.readyState < 2) { timerRef.current = setTimeout(tick, 150); return; }
-
-          const vw = video.videoWidth  || 1280;
-          const vh = video.videoHeight || 720;
-
-          // Crop: centre 70% width × 40% height (matches the on-screen box)
-          const cropW = Math.round(vw * 0.70);
-          const cropH = Math.round(vh * 0.40);
-          const cropX = Math.round((vw - cropW) / 2);
-          const cropY = Math.round((vh - cropH) / 2);
-
-          canvas.width  = cropW;
-          canvas.height = cropH;
-          ctx.drawImage(video, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
+          if (video.readyState < 2) { timerRef.current = setTimeout(tick, 100); return; }
 
           try {
-            const imageData = ctx.getImageData(0, 0, cropW, cropH);
-            const symbols   = await scanFn(imageData);
-            if (symbols.length > 0 && activeRef.current) {
-              const code = symbols[0].decode();
-              if (code) {
-                activeRef.current = false;
-                onBarcodeFound(code);
-                return;
-              }
+            let code = null;
+
+            if (detector) {
+              // ── Path 1: BarcodeDetector (VisionKit on iOS) ──────────────
+              // Detect directly on the video element — no canvas needed.
+              // VisionKit runs on the Neural Engine, extremely fast.
+              const results = await detector.detect(video);
+              if (results.length > 0) code = results[0].rawValue;
+
+            } else {
+              // ── Path 2: ZBar WASM fallback ──────────────────────────────
+              const vw = video.videoWidth  || 1280;
+              const vh = video.videoHeight || 720;
+              // Crop to centre scan box only
+              const cropW = Math.round(vw * 0.70);
+              const cropH = Math.round(vh * 0.40);
+              const cropX = Math.round((vw - cropW) / 2);
+              const cropY = Math.round((vh - cropH) / 2);
+              canvas.width  = cropW;
+              canvas.height = cropH;
+              ctx.drawImage(video, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
+              const imageData = ctx.getImageData(0, 0, cropW, cropH);
+              const symbols   = await zbarScan(imageData);
+              if (symbols.length > 0) code = symbols[0].decode();
+            }
+
+            if (code && activeRef.current) {
+              activeRef.current = false;
+              onBarcodeFound(code);
+              return;
             }
           } catch { /* skip bad frame */ }
 
-          timerRef.current = setTimeout(tick, 150);
+          // BarcodeDetector is fast enough to poll every 80ms; ZBar needs 150ms
+          timerRef.current = setTimeout(tick, detector ? 80 : 150);
         };
 
-        timerRef.current = setTimeout(tick, 300); // wait for camera to stabilise
+        timerRef.current = setTimeout(tick, 250); // wait for camera to stabilise
 
       } catch (err) {
         if (!cancelled) setCameraError(err.message || 'Không thể mở camera');
