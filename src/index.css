@@ -1,0 +1,36 @@
+@import "tailwindcss";
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: #0F0F0F;
+  color: white;
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', sans-serif;
+  -webkit-font-smoothing: antialiased;
+  overscroll-behavior: none;
+  /* smoother scroll momentum on iOS */
+  -webkit-overflow-scrolling: touch;
+}
+
+/* Bottom safe area */
+.pb-safe { padding-bottom: env(safe-area-inset-bottom, 0px); }
+
+/* Hide scrollbars */
+.scrollbar-none { scrollbar-width: none; -ms-overflow-style: none; }
+.scrollbar-none::-webkit-scrollbar { display: none; }
+
+/* Dark date picker */
+input[type="date"]::-webkit-calendar-picker-indicator {
+  filter: invert(1) opacity(0.4);
+}
+
+/* Tap highlight off */
+* { -webkit-tap-highlight-color: transparent; }
+
+/* GPU-promote scrollable lists */
+.scroll-gpu {
+  will-change: scroll-position;
+  -webkit-overflow-scrolling: touch;
+}
