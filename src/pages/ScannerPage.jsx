@@ -1,30 +1,35 @@
 /**
- * ScannerPage – optimised for iPhone 11 Pro Max / iOS Safari
+ * ScannerPage – optimised for iPhone 11 Pro Max
  *
- * Scanning strategy (fastest first):
- * 1. BarcodeDetector Web API  — iOS 17+ / Safari calls into VisionKit natively.
- *    This is the same engine as the Camera app. Sub-100ms detection.
- * 2. ZBar WASM fallback        — for Android Chrome and older iOS.
+ * Scanning strategy:
+ * 1. ZBar WASM            — primary engine (only option on iOS Safari)
+ * 2. BarcodeDetector API  — secondary path (Chrome/Android only)
  *
- * Other iOS-specific decisions:
- * - facingMode: 'environment' directly (enumerateDevices labels are empty before permission)
+ * iPhone 11 Pro Max optimisations:
+ * - Camera: 640×480 (4:3) — matches sensor aspect ratio, fastest for ZBar
+ * - ZBar poll: 80ms       — fast enough for real-time, not too CPU-heavy
+ * - Preload ZBar at import — zero delay when scanning starts
+ * - GS1 DataMatrix parser — extracts NSX (AI 11), HSD (AI 17/15), lot (AI 10)
+ * - Green flash animation on successful scan
+ *
+ * iOS-specific notes:
+ * - `playsInline` + `muted` required for video autoplay
+ * - `facingMode: { exact: 'environment' }` selects rear Wide camera (26mm f/1.8)
  * - No `advanced` constraints (torch/focusMode throw OverconstrainedError on iOS)
- * - Crop canvas to scan-box region only (saves ~80% ZBar work)
- * - `playsInline` + `muted` required for iOS autoplay
- * - height: 100dvh avoids Safari address-bar overlap
+ * - BarcodeDetector is NOT available on any iOS browser (all use WKWebView)
  */
 
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { ArrowLeft, Keyboard, Loader2, CheckCircle, Package, AlertCircle } from 'lucide-react';
+import { scanImageData } from '@undecaf/zbar-wasm';
 import { lookupBarcode } from '../services/barcodeApiService';
 import { useProducts } from '../context/ProductContext';
 
 const STEPS = { SCAN: 'scan', LOOKUP: 'lookup', FORM: 'form', SUCCESS: 'success' };
 
-// ─── BarcodeDetector (Web API → VisionKit on iOS) ─────────────────────────────
+// ─── BarcodeDetector (Chrome/Android only) ─────────────────────────────
 const hasBarcodeDetector = typeof window !== 'undefined' && 'BarcodeDetector' in window;
 
-// All formats supported by BarcodeDetector / VisionKit
 const BD_FORMATS = [
   'aztec','code_128','code_39','code_93','codabar','data_matrix',
   'ean_13','ean_8','itf','pdf417','qr_code','upc_a','upc_e',
@@ -33,68 +38,87 @@ const BD_FORMATS = [
 let _barcodeDetector = null;
 function getBarcodeDetector() {
   if (_barcodeDetector) return _barcodeDetector;
-  // eslint-disable-next-line no-undef
   _barcodeDetector = new BarcodeDetector({ formats: BD_FORMATS });
   return _barcodeDetector;
 }
 
-// ─── ZBar WASM fallback (lazy-loaded) ────────────────────────────────────────
-let _scanImageData = null;
-async function getZBarScan() {
-  if (_scanImageData) return _scanImageData;
-  const mod = await import('@undecaf/zbar-wasm');
-  _scanImageData = mod.scanImageData;
-  return _scanImageData;
-}
-
-// ─── GS1 date parser ─────────────────────────────────────────────────────────
-// GS1-128 / DataMatrix barcodes encode dates as YYMMDD inside Application Identifiers.
-// AI 11 = Production date, AI 15 = Best before, AI 17 = Expiry date
+// ─── GS1 DataMatrix parser ─────────────────────────────────────────────
+// GS1 Application Identifiers:
+//   AI (11) = Manufacture date  (YYMMDD)
+//   AI (15) = Best before date  (YYMMDD)
+//   AI (17) = Expiry date       (YYMMDD)
+//   AI (10) = Batch / Lot number
 function parseGS1Dates(raw) {
-  const result = { manufactureDate: '', expiryDate: '' };
+  const result = { manufactureDate: '', expiryDate: '', batchNumber: '' };
   if (!raw) return result;
 
-  // GS1 uses FNC1 (ASCII 29) or parenthesised AIs like (11)250101
-  // Normalise: strip parentheses, replace FNC1 with nothing
-  const s = raw.replace(/\((\d{2,4})\)/g, '$1').replace(/\x1d/g, '');
+  // Normalise: strip parentheses like (11)250101 → 11250101,
+  // replace FNC1 (ASCII 29) and other GS separators
+  const s = raw.replace(/\((\d{2,4})\)/g, '$1').replace(/[\x1d\x1c\x1e]/g, '');
 
   const parseYYMMDD = (yymmdd) => {
     if (!yymmdd || yymmdd.length < 6) return '';
     const yy = parseInt(yymmdd.slice(0, 2), 10);
     const mm = yymmdd.slice(2, 4);
-    const dd = yymmdd.slice(4, 6) === '00' ? '01' : yymmdd.slice(4, 6);
+    const dd = yymmdd.slice(4, 6);
+    // 00 day or 00 month is invalid
+    if (dd === '00' || mm === '00' || mm > '12') return '';
     const yyyy = yy >= 0 && yy <= 30 ? 2000 + yy : 1900 + yy;
     return `${yyyy}-${mm}-${dd}`;
   };
 
-  // Match AI patterns: 2-digit AI followed by 6-digit date
-  const aiMatch = (ai) => {
-    const re = new RegExp(`${ai}(\\d{6})`);
-    const m = s.match(re);
-    return m ? parseYYMMDD(m[1]) : '';
+  // Find AI followed by exactly 6 digits (date format YYMMDD)
+  const findDate = (ai) => {
+    const idx = s.indexOf(ai);
+    if (idx === -1) return '';
+    // AI must not be part of a longer number — check preceding char
+    if (idx > 0 && /\d/.test(s[idx - 1])) return '';
+    const dateStr = s.substring(idx + ai.length, idx + ai.length + 6);
+    return parseYYMMDD(dateStr);
   };
 
-  result.manufactureDate = aiMatch('11');
-  result.expiryDate      = aiMatch('17') || aiMatch('15');
+  // Extract batch/lot number (AI 10) — variable length, alphanumeric,
+  // delimited by next AI (2+ digits) or end of string
+  const extractLot = () => {
+    const idx = s.indexOf('10');
+    if (idx === -1) return '';
+    // Preceding char must not be a digit (avoid matching inside a larger number)
+    if (idx > 0 && /\d/.test(s[idx - 1])) return '';
+    const start = idx + 2;
+    let end = start;
+    while (end < s.length) {
+      // If we find 2+ consecutive digits that look like a new AI, stop
+      // (GS1 AIs are 2-4 digits, so 2+ digits likely starts next AI)
+      if (end >= start + 1 && /^\d{2,}/.test(s.substring(end))) break;
+      end++;
+    }
+    return s.substring(start, end).replace(/[^\w\-./]/g, '').trim();
+  };
+
+  result.manufactureDate = findDate('11');
+  result.expiryDate      = findDate('17') || findDate('15');
+  result.batchNumber     = extractLot();
+
   return result;
 }
 
-// ─── Camera open (iOS-safe) ───────────────────────────────────────────────────
+// ─── Camera open (optimised for iPhone 11 Pro Max) ─────────────────────
 async function openCamera() {
-  // On iOS, always use facingMode: environment — deviceId enumeration requires
-  // prior permission and labels are empty before that.
+  // iPhone 11 Pro Max Wide camera: 12MP, 26mm, f/1.8, OIS
+  // 640×480 (4:3) matches sensor native aspect ratio → no crop, max FOV
+  // Sufficient resolution for ZBar — keeps canvas small → faster processing
   const constraints = {
     video: {
-      facingMode: { ideal: 'environment' },
-      width:  { ideal: 1280 },   // 1280×720 is the sweet spot: sharp enough, not too heavy
-      height: { ideal: 720 },
+      facingMode: { exact: 'environment' },
+      width:  { ideal: 640 },
+      height: { ideal: 480 },
     },
     audio: false,
   };
   return navigator.mediaDevices.getUserMedia(constraints);
 }
 
-// ─── Main component ───────────────────────────────────────────────────────────
+// ─── Main component ────────────────────────────────────────────────────
 export function ScannerPage({ onBack, onNavigate }) {
   const { addProduct } = useProducts();
 
@@ -102,19 +126,20 @@ export function ScannerPage({ onBack, onNavigate }) {
   const canvasRef   = useRef(null);
   const streamRef   = useRef(null);
   const timerRef    = useRef(null);
-  const activeRef   = useRef(true);   // false once a barcode is found
+  const activeRef   = useRef(true);
 
   const [step, setStep]             = useState(STEPS.SCAN);
   const [manualMode, setManualMode] = useState(false);
   const [manualBarcode, setManualBarcode] = useState('');
   const [lookupData, setLookupData] = useState(null);
   const [cameraError, setCameraError] = useState(null);
+  const [scanFlash, setScanFlash]   = useState(false);
   const [form, setForm] = useState({
     name: '', brand: '', barcode: '', manufactureDate: '', expiryDate: '',
     notifyDate: '', quantity: 1, imageUrl: '', notes: '',
   });
 
-  // ── Camera + scan loop ────────────────────────────────────────────────────
+  // ── Camera + scan loop ─────────────────────────────────────────────
   useEffect(() => {
     if (manualMode || step !== STEPS.SCAN) return;
     activeRef.current = true;
@@ -128,8 +153,6 @@ export function ScannerPage({ onBack, onNavigate }) {
         streamRef.current = stream;
         const video = videoRef.current;
         video.srcObject = stream;
-
-        // iOS requires a user-gesture or these attributes to autoplay
         video.setAttribute('playsinline', '');
         video.setAttribute('muted', '');
         await video.play().catch(() => {});
@@ -137,30 +160,27 @@ export function ScannerPage({ onBack, onNavigate }) {
         const canvas = canvasRef.current;
         const ctx    = canvas.getContext('2d', { willReadFrequently: true });
 
-        // Pre-load ZBar only if BarcodeDetector is unavailable
-        const zbarScan = hasBarcodeDetector ? null : await getZBarScan();
+        // ZBar is already loaded eagerly at import time (zero delay).
+        // BarcodeDetector is initialised on demand for Chrome/Android.
         const detector = hasBarcodeDetector ? getBarcodeDetector() : null;
 
-        // ── Scan tick ──────────────────────────────────────────────────────
+        // ── Scan tick ──────────────────────────────────────────────
         const tick = async () => {
           if (cancelled || !activeRef.current) return;
-          if (video.readyState < 2) { timerRef.current = setTimeout(tick, 100); return; }
+          if (video.readyState < 2) { timerRef.current = setTimeout(tick, 50); return; }
 
           try {
             let code = null;
+            const vw = video.videoWidth  || 640;
+            const vh = video.videoHeight || 480;
 
             if (detector) {
-              // ── Path 1: BarcodeDetector (VisionKit on iOS) ──────────────
-              // Detect directly on the video element — no canvas needed.
-              // VisionKit runs on the Neural Engine, extremely fast.
+              // Path: BarcodeDetector (Chrome/Android via native API)
               const results = await detector.detect(video);
               if (results.length > 0) code = results[0].rawValue;
-
             } else {
-              // ── Path 2: ZBar WASM fallback ──────────────────────────────
-              const vw = video.videoWidth  || 1280;
-              const vh = video.videoHeight || 720;
-              // Crop to centre scan box only
+              // Path: ZBar WASM — primary engine on iPhone 11 Pro Max
+              // Crop to centre scan box only → reduces pixel count ~72%
               const cropW = Math.round(vw * 0.70);
               const cropH = Math.round(vh * 0.40);
               const cropX = Math.round((vw - cropW) / 2);
@@ -169,22 +189,26 @@ export function ScannerPage({ onBack, onNavigate }) {
               canvas.height = cropH;
               ctx.drawImage(video, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
               const imageData = ctx.getImageData(0, 0, cropW, cropH);
-              const symbols   = await zbarScan(imageData);
+              const symbols   = await scanImageData(imageData);
               if (symbols.length > 0) code = symbols[0].decode();
             }
 
             if (code && activeRef.current) {
               activeRef.current = false;
+              // Green flash — visual feedback on success
+              setScanFlash(true);
+              setTimeout(() => setScanFlash(false), 250);
               onBarcodeFound(code);
               return;
             }
-          } catch { /* skip bad frame */ }
+          } catch { /* skip bad frame — continue scanning */ }
 
-          // BarcodeDetector is fast enough to poll every 80ms; ZBar needs 150ms
-          timerRef.current = setTimeout(tick, detector ? 80 : 150);
+          // 80ms interval: fast enough for real-time, leaves CPU for rendering
+          timerRef.current = setTimeout(tick, 80);
         };
 
-        timerRef.current = setTimeout(tick, 250); // wait for camera to stabilise
+        // Allow camera to stabilise before first scan attempt
+        timerRef.current = setTimeout(tick, 300);
 
       } catch (err) {
         if (!cancelled) setCameraError(err.message || 'Không thể mở camera');
@@ -206,16 +230,16 @@ export function ScannerPage({ onBack, onNavigate }) {
     }
   };
 
-  // ── Barcode found ─────────────────────────────────────────────────────────
+  // ── Barcode found ─────────────────────────────────────────────────
   const onBarcodeFound = useCallback(async (barcode) => {
     clearTimeout(timerRef.current);
     stopStream();
     setStep(STEPS.LOOKUP);
 
-    // Parse GS1 dates embedded in the barcode itself
+    // Parse GS1 dates + lot number from the barcode itself
     const gs1 = parseGS1Dates(barcode);
 
-    // Lookup product info from APIs
+    // Lookup product info from online APIs
     const data = await lookupBarcode(barcode);
     setLookupData(data);
 
@@ -225,7 +249,6 @@ export function ScannerPage({ onBack, onNavigate }) {
       name:            data.name     || '',
       brand:           data.brand    || '',
       imageUrl:        data.imageUrl || '',
-      // Prefer API dates, fall back to GS1-parsed dates from barcode
       manufactureDate: data.manufactureDate || gs1.manufactureDate || '',
       expiryDate:      data.expiryDate      || gs1.expiryDate      || '',
     }));
@@ -251,9 +274,10 @@ export function ScannerPage({ onBack, onNavigate }) {
     setManualBarcode('');
     setForm({ name: '', brand: '', barcode: '', manufactureDate: '', expiryDate: '', notifyDate: '', quantity: 1, imageUrl: '', notes: '' });
     setLookupData(null);
+    setScanFlash(false);
   };
 
-  // ── Render ────────────────────────────────────────────────────────────────
+  // ── Render ────────────────────────────────────────────────────────
   if (step === STEPS.SUCCESS) {
     return (
       <div className="flex flex-col items-center justify-center min-h-screen gap-4">
@@ -279,21 +303,21 @@ export function ScannerPage({ onBack, onNavigate }) {
     return <ProductForm form={form} setForm={setForm} onSubmit={handleFormSubmit} onBack={resetScanner} lookupData={lookupData} />;
   }
 
-  // ── SCAN UI ───────────────────────────────────────────────────────────────
+  // ── SCAN UI ───────────────────────────────────────────────────────
   return (
     <div className="flex flex-col min-h-screen bg-black" style={{ height: '100dvh' }}>
       {/* Header */}
       <div className="flex items-center gap-4 px-5 pt-14 pb-4 z-10 relative flex-shrink-0">
         <button
           onClick={onBack}
-          className="w-10 h-10 rounded-full flex items-center justify-center"
+          className="w-11 h-11 rounded-2xl flex items-center justify-center active:scale-90 transition-all"
           style={{ background: 'rgba(255,255,255,0.08)' }}
         >
           <ArrowLeft size={20} className="text-white" />
         </button>
         <div className="flex-1">
           <h2 className="text-white font-bold text-lg">Quét mã barcode</h2>
-          <p className="text-white/40 text-sm">Hướng camera vào mã vạch sản phẩm</p>
+          <p className="text-white/40 text-sm">Hướng camera vào mã vạch</p>
         </div>
       </div>
 
@@ -336,7 +360,7 @@ export function ScannerPage({ onBack, onNavigate }) {
               <p className="text-white/70 font-semibold">{cameraError}</p>
               <button
                 onClick={() => setManualMode(true)}
-                className="px-6 py-3 rounded-2xl font-semibold"
+                className="px-6 py-3 rounded-2xl font-semibold transition-all active:scale-95"
                 style={{ background: 'rgba(255,255,255,0.08)', color: 'white' }}
               >
                 Nhập thủ công
@@ -344,7 +368,7 @@ export function ScannerPage({ onBack, onNavigate }) {
             </div>
           ) : (
             <div className="relative flex-1 overflow-hidden">
-              {/* Full-screen video */}
+              {/* Camera feed — full screen behind everything */}
               <video
                 ref={videoRef}
                 className="absolute inset-0 w-full h-full object-cover"
@@ -353,21 +377,29 @@ export function ScannerPage({ onBack, onNavigate }) {
                 muted
               />
 
-              {/* Hidden canvas for ZBar */}
+              {/* Hidden canvas for ZBar processing */}
               <canvas ref={canvasRef} className="hidden" />
 
-              {/* Overlay: darken outside scan box */}
-              <div className="absolute inset-0 pointer-events-none" style={{ background: 'rgba(0,0,0,0.5)' }} />
+              {/* Green flash overlay on successful scan */}
+              {scanFlash && (
+                <div
+                  className="absolute inset-0 z-20 pointer-events-none"
+                  style={{
+                    background: 'rgba(0,230,118,0.35)',
+                    animation: 'flashOut 0.25s ease-out',
+                  }}
+                />
+              )}
 
-              {/* Scan box — centred, 70% wide × 35% tall */}
+              {/* Scan box — clear camera in centre, dark outside via boxShadow */}
               <div
-                className="absolute pointer-events-none"
+                className="absolute pointer-events-none z-10"
                 style={{
                   left: '15%', right: '15%',
                   top: '32%',  bottom: '33%',
-                  border: '2px solid rgba(0,230,118,0.9)',
+                  border: '2px solid rgba(0,230,118,0.85)',
                   borderRadius: 16,
-                  boxShadow: '0 0 0 9999px rgba(0,0,0,0.5), 0 0 32px rgba(0,230,118,0.3)',
+                  boxShadow: '0 0 0 9999px rgba(0,0,0,0.55), 0 0 24px rgba(0,230,118,0.25)',
                   background: 'transparent',
                 }}
               >
@@ -381,19 +413,20 @@ export function ScannerPage({ onBack, onNavigate }) {
                   <div key={i} className="absolute w-7 h-7" style={s} />
                 ))}
 
-                {/* Scan line */}
+                {/* Scan line animation */}
                 <div
-                  className="absolute left-3 right-3 h-px"
+                  className="absolute left-2 right-2 h-px"
                   style={{
                     background: 'linear-gradient(90deg, transparent, #00E676, transparent)',
                     animation: 'scanLine 1.6s ease-in-out infinite',
+                    willChange: 'top, opacity',
                   }}
                 />
               </div>
 
               {/* Hint text */}
               <p
-                className="absolute text-white/70 text-sm font-medium text-center w-full"
+                className="absolute text-white/70 text-sm font-medium text-center w-full z-10"
                 style={{ bottom: '28%' }}
               >
                 Đặt mã vạch vào khung
@@ -405,7 +438,7 @@ export function ScannerPage({ onBack, onNavigate }) {
           <div className="flex-shrink-0 p-5 pb-8">
             <button
               onClick={() => setManualMode(true)}
-              className="w-full py-3.5 rounded-2xl font-semibold text-sm flex items-center justify-center gap-2"
+              className="w-full py-3.5 rounded-2xl font-semibold text-sm flex items-center justify-center gap-2 active:scale-95 transition-all"
               style={{ background: 'rgba(255,255,255,0.09)', color: 'rgba(255,255,255,0.75)' }}
             >
               <Keyboard size={18} />
@@ -417,16 +450,20 @@ export function ScannerPage({ onBack, onNavigate }) {
 
       <style>{`
         @keyframes scanLine {
-          0%   { top: 6%;  opacity: 0.4; }
+          0%   { top: 6%;  opacity: 0.3; }
           50%  { top: 88%; opacity: 1;   }
-          100% { top: 6%;  opacity: 0.4; }
+          100% { top: 6%;  opacity: 0.3; }
+        }
+        @keyframes flashOut {
+          0%   { opacity: 1; }
+          100% { opacity: 0; }
         }
       `}</style>
     </div>
   );
 }
 
-// ─── Product Form ─────────────────────────────────────────────────────────────
+// ─── Product Form ──────────────────────────────────────────────────────
 function ProductForm({ form, setForm, onSubmit, onBack, lookupData }) {
   const set = (key, val) => setForm(f => ({ ...f, [key]: val }));
   const isValid = form.name.trim() !== '';
@@ -442,7 +479,7 @@ function ProductForm({ form, setForm, onSubmit, onBack, lookupData }) {
       <div className="flex items-center gap-4 px-5 pt-14 pb-5">
         <button
           onClick={onBack}
-          className="w-10 h-10 rounded-full flex items-center justify-center"
+          className="w-10 h-10 rounded-full flex items-center justify-center active:scale-90 transition-all"
           style={{ background: 'rgba(255,255,255,0.08)' }}
         >
           <ArrowLeft size={20} className="text-white" />
@@ -508,13 +545,13 @@ function ProductForm({ form, setForm, onSubmit, onBack, lookupData }) {
           <div className="flex items-center gap-3 px-1">
             <button
               onClick={() => set('quantity', Math.max(1, form.quantity - 1))}
-              className="w-10 h-10 rounded-xl flex items-center justify-center text-white font-bold"
+              className="w-10 h-10 rounded-xl flex items-center justify-center text-white font-bold active:scale-90 transition-all"
               style={{ background: 'rgba(255,255,255,0.06)' }}
             >−</button>
             <span className="text-white font-bold text-lg flex-1 text-center">{form.quantity}</span>
             <button
               onClick={() => set('quantity', form.quantity + 1)}
-              className="w-10 h-10 rounded-xl flex items-center justify-center font-bold"
+              className="w-10 h-10 rounded-xl flex items-center justify-center font-bold active:scale-90 transition-all"
               style={{ background: 'rgba(0,230,118,0.12)', color: '#00E676' }}
             >+</button>
           </div>
