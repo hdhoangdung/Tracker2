@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { ProductProvider } from './context/ProductContext';
-import { BottomNav } from './components/BottomNav';
+import { BottomNav, ProductCard } from './components';
 import { HomePage } from './pages/HomePage';
 import { ScannerPage } from './pages/ScannerPage';
 import { DetailPage } from './pages/DetailPage';
@@ -22,8 +22,7 @@ export default function App() {
 
   return (
     <ProductProvider>
-      <div className="min-h-screen max-w-md mx-auto relative" style={{ background: '#0F0F0F' }}>
-        {/* Pages */}
+      <div className="min-h-screen max-w-md mx-auto relative" style={{ background: 'var(--bg-primary)' }}>
         {tab === 'detail' && selectedProductId ? (
           <DetailPage productId={selectedProductId} onBack={handleBack} />
         ) : tab === 'scanner' ? (
