@@ -1,18 +1,23 @@
 /**
- * ScannerPage – iPhone 11 Pro Max · Ultra-fast scanning · Redesigned UI
+ * ScannerPage – iPhone 11 Pro Max · html5-qrcode (ZXing) engine · Custom UI
  *
- * Scanning engine (ZBar WASM — works on all iOS browsers):
- * - Camera: max 480×360 → ZBar processes ~58K pixels/frame → ~10-20ms/frame
- * - requestAnimationFrame loop @ 40ms → instant response, no setTimeout lag
- * - Pre-allocated canvas → zero GC pressure, no re-allocation per frame
- * - No initial delay → first scan attempt ~50ms after camera starts
+ * WHY html5-qrcode instead of ZBar WASM:
+ * - @undecaf/zbar-wasm requires vite-plugin-wasm to serve .wasm files correctly
+ * - Without the plugin, the WASM binary 404s in production builds → scanner silent-fails
+ * - html5-qrcode is pure JS (no WASM), handles camera + decoding in one package
+ * - ZXing engine (battle-tested, supports EAN-13, UPC, Code 128, QR, etc.)
+ * - 151K weekly downloads, actively maintained
  *
- * GS1 parser extracts: NSX (AI 11), HSD (AI 17/15), Lot (AI 10) from barcode
+ * Architecture:
+ * - Html5Qrcode class (not Html5QrcodeScanner) → no built-in UI, we overlay our own
+ * - Camera renders into #reader div, our custom scan box overlays on top
+ * - fps: 10 → good balance of speed vs battery on iPhone
+ * - qrbox: 400×250 → restricts scan region for accuracy
  */
 
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { ArrowLeft, Keyboard, CheckCircle, Package, AlertCircle } from 'lucide-react';
-import { scanImageData } from '@undecaf/zbar-wasm';
+import { Html5Qrcode } from 'html5-qrcode';
 import { lookupBarcode } from '../services/barcodeApiService';
 import { useProducts } from '../context/ProductContext';
 
@@ -54,42 +59,15 @@ function parseGS1Dates(raw) {
   return result;
 }
 
-// ─── Camera open — balances resolution vs ZBar speed ─────────────────
-async function openCamera() {
-  // 640×480 (VGA) gives enough detail for EAN-13/GS1 while keeping
-  // pixel count low enough for ZBar WASM to process in ~15-25ms.
-  // `ideal` (not `exact`) lets iOS Safari fall back gracefully.
-  const constraints = {
-    video: {
-      facingMode: { ideal: 'environment' },
-      width:  { min: 480, ideal: 640, max: 1280 },
-      height: { min: 360, ideal: 480, max: 720 },
-    },
-    audio: false,
-  };
-  try {
-    return await navigator.mediaDevices.getUserMedia(constraints);
-  } catch (e) {
-    // Fallback: drop `ideal` facingMode in case OverconstrainedError
-    console.warn('[Scanner] First camera attempt failed:', e.message);
-    const fallback = {
-      video: { facingMode: 'environment', width: { ideal: 640 }, height: { ideal: 480 } },
-      audio: false,
-    };
-    return navigator.mediaDevices.getUserMedia(fallback);
-  }
-}
+// ─── Helpers ───────────────────────────────────────────────────────────
+const once = (fn) => { let called = false; return (...args) => { if (called) return; called = true; return fn(...args); }; };
 
 // ─── Main component ────────────────────────────────────────────────────
 export function ScannerPage({ onBack, onNavigate }) {
   const { addProduct } = useProducts();
 
-  const videoRef   = useRef(null);
-  const canvasRef  = useRef(null);
-  const streamRef  = useRef(null);
-  const rafRef     = useRef(null);
-  const activeRef  = useRef(true);
-  const dimsRef    = useRef({ w: 0, h: 0 });  // cached canvas dimensions
+  const scannerRef    = useRef(null);
+  const scanningRef   = useRef(false);
 
   const [step, setStep]             = useState(STEPS.SCAN);
   const [manualMode, setManualMode] = useState(false);
@@ -102,111 +80,8 @@ export function ScannerPage({ onBack, onNavigate }) {
     notifyDate: '', quantity: 1, imageUrl: '', notes: '',
   });
 
-  // ── Scan loop (requestAnimationFrame) ─────────────────────────────
-  useEffect(() => {
-    if (manualMode || step !== STEPS.SCAN) return;
-    activeRef.current = true;
-    let cancelled = false;
-
-    (async () => {
-      try {
-        const stream = await openCamera();
-        if (cancelled) { stream.getTracks().forEach(t => t.stop()); return; }
-
-        streamRef.current = stream;
-        const video = videoRef.current;
-        video.srcObject = stream;
-        video.setAttribute('playsinline', '');
-        video.setAttribute('muted', '');
-        await video.play().catch(() => {});
-
-        const canvas = canvasRef.current;
-        const ctx    = canvas.getContext('2d', { willReadFrequently: true });
-
-        let lastScan = 0;
-        const SCAN_MS = 40; // ~25 scans/sec — fast, leaves CPU for rendering
-
-        const tick = async (timestamp) => {
-          if (cancelled || !activeRef.current) { rafRef.current = null; return; }
-
-          // Always schedule next frame first (ensures smooth loop)
-          rafRef.current = requestAnimationFrame(tick);
-
-          // Rate-limit actual processing to SCAN_MS
-          if (timestamp - lastScan < SCAN_MS) return;
-          lastScan = timestamp;
-
-          if (video.readyState < 2) return;
-
-          try {
-            const vw = video.videoWidth;
-            const vh = video.videoHeight;
-            if (!vw || !vh) return;
-
-            // Crop to scan box region: centre 85% × 60%
-            // Larger crop = barcode more likely to be inside
-            const cropW = Math.round(vw * 0.85);
-            const cropH = Math.round(vh * 0.60);
-            const cropX = Math.round((vw - cropW) / 2);
-            const cropY = Math.round((vh - cropH) / 2);
-
-            // Pre-allocate canvas — only re-allocate when dimensions change
-            const d = dimsRef.current;
-            if (d.w !== cropW || d.h !== cropH) {
-              canvas.width  = cropW;
-              canvas.height = cropH;
-              d.w = cropW;
-              d.h = cropH;
-            }
-
-            ctx.drawImage(video, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
-            const imageData = ctx.getImageData(0, 0, cropW, cropH);
-            const symbols = await scanImageData(imageData);
-
-            if (symbols.length > 0 && activeRef.current) {
-              const code = symbols[0].decode();
-              if (code) {
-                activeRef.current = false;
-                setScanFlash(true);
-                setTimeout(() => setScanFlash(false), 300);
-                onBarcodeFound(code);
-                rafRef.current = null;
-                return;
-              }
-            }
-          } catch (err) {
-            if (import.meta.env.DEV) {
-              console.warn('[Scanner] scan error:', err);
-            }
-          }
-        };
-
-        // Start scanning immediately (no artificial delay)
-        rafRef.current = requestAnimationFrame(tick);
-
-      } catch (err) {
-        if (!cancelled) setCameraError(err.message || 'Không thể mở camera');
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-      if (rafRef.current) cancelAnimationFrame(rafRef.current);
-      stopStream();
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [manualMode, step]);
-
-  const stopStream = () => {
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(t => t.stop());
-      streamRef.current = null;
-    }
-  };
-
-  // ── Barcode found ─────────────────────────────────────────────────
+  // ── Barcode found → lookup → form ─────────────────────────────────
   const onBarcodeFound = useCallback(async (barcode) => {
-    stopStream();
     setStep(STEPS.LOOKUP);
     const gs1 = parseGS1Dates(barcode);
     const data = await lookupBarcode(barcode);
@@ -223,9 +98,63 @@ export function ScannerPage({ onBack, onNavigate }) {
     setStep(STEPS.FORM);
   }, []);
 
+  // ── Init html5-qrcode scanner ─────────────────────────────────────
+  useEffect(() => {
+    if (manualMode || step !== STEPS.SCAN) return;
+
+    let cancelled = false;
+    scanningRef.current = true;
+    setCameraError(null);
+
+    const scanner = new Html5Qrcode('reader');
+    scannerRef.current = scanner;
+
+    // Ensure onSuccess fires only once (prevent double-detect)
+    const onSuccess = once((decodedText) => {
+      if (cancelled || !scanningRef.current) return;
+      scanningRef.current = false;
+
+      // Flash feedback
+      setScanFlash(true);
+      setTimeout(() => setScanFlash(false), 300);
+
+      // Stop scanner, then transition
+      scanner.stop().catch(() => {});
+      onBarcodeFound(decodedText);
+    });
+
+    // onError fires for every frame without a detection — ignore silently
+    const onError = () => {};
+
+    scanner.start(
+      // Camera: back camera, medium resolution for speed
+      { facingMode: 'environment' },
+      {
+        fps: 10,                        // 10 frames/sec — plenty for barcodes
+        qrbox: { width: 400, height: 250 },  // scan region inside frame
+      },
+      onSuccess,
+      onError,
+    ).catch((err) => {
+      if (!cancelled) {
+        console.warn('[Scanner] Camera failed:', err?.message || err);
+        setCameraError(err?.message || 'Không thể mở camera');
+      }
+    });
+
+    return () => {
+      cancelled = true;
+      scanningRef.current = false;
+      scannerRef.current?.stop().catch(() => {});
+      scannerRef.current = null;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [manualMode, step]);
+
+  // ── Handlers ──────────────────────────────────────────────────────
   const handleManualSubmit = () => {
     if (!manualBarcode.trim()) return;
-    activeRef.current = false;
+    scanningRef.current = false;
     onBarcodeFound(manualBarcode.trim());
   };
 
@@ -238,8 +167,10 @@ export function ScannerPage({ onBack, onNavigate }) {
 
   const resetScanner = () => {
     setStep(STEPS.SCAN);
-    activeRef.current = true;
+    scanningRef.current = true;
+    setManualMode(false);
     setManualBarcode('');
+    setCameraError(null);
     setForm({ name: '', brand: '', barcode: '', manufactureDate: '', expiryDate: '', notifyDate: '', quantity: 1, imageUrl: '', notes: '' });
     setLookupData(null);
     setScanFlash(false);
@@ -250,7 +181,6 @@ export function ScannerPage({ onBack, onNavigate }) {
     return (
       <div className="flex flex-col items-center justify-center min-h-screen bg-black gap-4">
         <div className="relative">
-          {/* Expanding green circle */}
           <div className="animate-successExpand w-24 h-24 rounded-full bg-[#00E676] flex items-center justify-center">
             <CheckCircle size={48} className="text-black" strokeWidth={2.5} />
           </div>
@@ -276,7 +206,7 @@ export function ScannerPage({ onBack, onNavigate }) {
     return <ProductForm form={form} setForm={setForm} onSubmit={handleFormSubmit} onBack={resetScanner} lookupData={lookupData} />;
   }
 
-  // ── Render: SCAN (redesigned UI) ──────────────────────────────────
+  // ── Render: SCAN ──────────────────────────────────────────────────
   return (
     <div className="flex flex-col min-h-screen bg-black" style={{ height: '100dvh' }}>
       {manualMode ? (
@@ -310,17 +240,16 @@ export function ScannerPage({ onBack, onNavigate }) {
           </button>
         </div>
       ) : (
-        /* ══ Camera view (redesigned) ══ */
-        <div className="relative flex-1 overflow-hidden">
-          {/* Camera feed */}
-          <video ref={videoRef} className="absolute inset-0 w-full h-full object-cover" autoPlay playsInline muted />
-          <canvas ref={canvasRef} className="hidden" />
+        /* ══ Camera view (html5-qrcode engine + custom overlay) ══ */
+        <div className="relative flex-1 overflow-hidden bg-black" style={{ minHeight: '60dvh' }}>
+          {/* html5-qrcode renders its <video> inside here */}
+          <div id="reader" className="absolute inset-0 w-full h-full z-0" />
 
           {/* Gradient overlays for readability */}
-          <div className="absolute inset-x-0 top-0 h-48 bg-gradient-to-b from-black/70 via-black/30 to-transparent z-10" />
-          <div className="absolute inset-x-0 bottom-0 h-48 bg-gradient-to-t from-black/70 via-black/30 to-transparent z-10" />
+          <div className="absolute inset-x-0 top-0 h-48 bg-gradient-to-b from-black/70 via-black/30 to-transparent z-10 pointer-events-none" />
+          <div className="absolute inset-x-0 bottom-0 h-48 bg-gradient-to-t from-black/70 via-black/30 to-transparent z-10 pointer-events-none" />
 
-          {/* Top bar (glassmorphism) */}
+          {/* Top bar */}
           <div className="absolute top-0 inset-x-0 z-20 flex items-center justify-between px-5 pt-14">
             <button
               onClick={onBack}
@@ -346,7 +275,7 @@ export function ScannerPage({ onBack, onNavigate }) {
             />
           )}
 
-          {/* Scan box — larger, with breathing glow */}
+          {/* Scan box overlay */}
           <div
             className="absolute pointer-events-none z-10"
             style={{
@@ -357,7 +286,7 @@ export function ScannerPage({ onBack, onNavigate }) {
               background: 'transparent',
             }}
           >
-            {/* Animated border glow */}
+            {/* Animated border */}
             <div
               className="absolute inset-0 rounded-[20px]"
               style={{
@@ -365,7 +294,6 @@ export function ScannerPage({ onBack, onNavigate }) {
                 animation: 'borderPulse 2.4s ease-in-out infinite',
               }}
             />
-
             {/* Corner marks */}
             {[
               { top: -2, left: -2,  borderTop: '3px solid #00E676', borderLeft: '3px solid #00E676', borderRadius: '16px 0 0 0' },
@@ -375,7 +303,6 @@ export function ScannerPage({ onBack, onNavigate }) {
             ].map((s, i) => (
               <div key={i} className="absolute w-6 h-6" style={s} />
             ))}
-
             {/* Scan line */}
             <div
               className="absolute left-2 right-2 h-[1.5px]"
@@ -388,27 +315,46 @@ export function ScannerPage({ onBack, onNavigate }) {
           </div>
 
           {/* Hint text */}
-          <p className="absolute inset-x-0 z-10 text-white/80 text-xs font-medium text-center tracking-wide drop-shadow-lg" style={{ bottom: '32%' }}>
+          <p className="absolute inset-x-0 z-10 text-white/80 text-xs font-medium text-center tracking-wide drop-shadow-lg pointer-events-none" style={{ bottom: '32%' }}>
             Tự động nhận diện — giữ máy ổn định
           </p>
 
-          {/* Bottom action — floating glassmorphism button */}
-          <div className="absolute inset-x-0 bottom-0 z-20 flex justify-center pb-12">
-            <button
-              onClick={() => setManualMode(true)}
-              className="flex items-center gap-2.5 px-6 py-3.5 rounded-2xl text-sm font-semibold active:scale-95 transition-all"
-              style={{
-                background: 'rgba(255,255,255,0.1)',
-                backdropFilter: 'blur(16px)',
-                WebkitBackdropFilter: 'blur(16px)',
-                border: '1px solid rgba(255,255,255,0.12)',
-                color: 'rgba(255,255,255,0.85)',
-              }}
-            >
-              <Keyboard size={17} />
-              Nhập mã thủ công
-            </button>
-          </div>
+          {/* Camera error + manual fallback */}
+          {cameraError && (
+            <div className="absolute inset-0 z-30 flex flex-col items-center justify-center bg-black/80 gap-4 px-6">
+              <div className="w-14 h-14 rounded-full flex items-center justify-center" style={{ background: 'rgba(255,68,68,0.15)' }}>
+                <AlertCircle size={28} className="text-red-400" />
+              </div>
+              <p className="text-white text-sm text-center">{cameraError}</p>
+              <button
+                onClick={() => setManualMode(true)}
+                className="px-6 py-3 rounded-2xl font-semibold text-sm transition-all active:scale-95"
+                style={{ background: '#00E676', color: '#0F0F0F' }}
+              >
+                Nhập mã thủ công
+              </button>
+            </div>
+          )}
+
+          {/* Bottom action */}
+          {!cameraError && (
+            <div className="absolute inset-x-0 bottom-0 z-20 flex justify-center pb-12">
+              <button
+                onClick={() => setManualMode(true)}
+                className="flex items-center gap-2.5 px-6 py-3.5 rounded-2xl text-sm font-semibold active:scale-95 transition-all"
+                style={{
+                  background: 'rgba(255,255,255,0.1)',
+                  backdropFilter: 'blur(16px)',
+                  WebkitBackdropFilter: 'blur(16px)',
+                  border: '1px solid rgba(255,255,255,0.12)',
+                  color: 'rgba(255,255,255,0.85)',
+                }}
+              >
+                <Keyboard size={17} />
+                Nhập mã thủ công
+              </button>
+            </div>
+          )}
         </div>
       )}
 
@@ -435,12 +381,21 @@ export function ScannerPage({ onBack, onNavigate }) {
         .animate-successExpand {
           animation: successExpand 0.4s cubic-bezier(0.34, 1.56, 0.64, 1) forwards;
         }
+        /* Force html5-qrcode video to fill container */
+        #reader video {
+          width: 100% !important;
+          height: 100% !important;
+          object-fit: cover !important;
+          position: absolute !important;
+          top: 0 !important;
+          left: 0 !important;
+        }
       `}</style>
     </div>
   );
 }
 
-// ─── Product Form (polished) ───────────────────────────────────────────
+// ─── Product Form ──────────────────────────────────────────────────────
 function ProductForm({ form, setForm, onSubmit, onBack, lookupData }) {
   const set = (key, val) => setForm(f => ({ ...f, [key]: val }));
   const isValid = form.name.trim() !== '';
@@ -453,7 +408,6 @@ function ProductForm({ form, setForm, onSubmit, onBack, lookupData }) {
 
   return (
     <div className="flex flex-col min-h-screen bg-black">
-      {/* Header */}
       <div className="flex items-center gap-4 px-5 pt-14 pb-4">
         <button
           onClick={onBack}
@@ -471,7 +425,6 @@ function ProductForm({ form, setForm, onSubmit, onBack, lookupData }) {
       </div>
 
       <div className="flex-1 px-5 flex flex-col gap-4 overflow-y-auto pb-8">
-        {/* Product image */}
         {form.imageUrl ? (
           <div className="w-full h-40 rounded-2xl overflow-hidden flex items-center justify-center" style={{ background: 'rgba(255,255,255,0.04)' }}>
             <img src={form.imageUrl} alt="" className="h-full object-contain" onError={e => set('imageUrl', '')} />
@@ -490,29 +443,23 @@ function ProductForm({ form, setForm, onSubmit, onBack, lookupData }) {
         <Field label="Tên sản phẩm *" required>
           <input type="text" value={form.name} onChange={e => set('name', e.target.value)} placeholder="Nhập tên" className={inputCls} />
         </Field>
-
         <Field label="Thương hiệu">
           <input type="text" value={form.brand} onChange={e => set('brand', e.target.value)} placeholder="Vinamilk, Nestle..." className={inputCls} />
         </Field>
-
         <Field label="Ngày sản xuất (NSX)">
           <input type="date" value={form.manufactureDate} onChange={e => set('manufactureDate', e.target.value)} className={inputCls} style={{ colorScheme: 'dark' }} />
         </Field>
-
         <Field label="Hạn sử dụng (HSD)">
           <input type="date" value={form.expiryDate} onChange={e => set('expiryDate', e.target.value)} className={inputCls} style={{ colorScheme: 'dark' }} />
         </Field>
-
         {autoThresholdDays !== null && (
           <p className="text-white/35 text-xs px-1 -mt-2">Ngưỡng cảnh báo: ~{autoThresholdDays} ngày</p>
         )}
-
         {!form.manufactureDate && (
           <Field label="Ngày thông báo">
             <input type="date" value={form.notifyDate || ''} onChange={e => set('notifyDate', e.target.value)} className={inputCls} style={{ colorScheme: 'dark' }} />
           </Field>
         )}
-
         <Field label="Số lượng">
           <div className="flex items-center gap-4 px-2 py-1">
             <button onClick={() => set('quantity', Math.max(1, form.quantity - 1))} className="w-9 h-9 rounded-xl flex items-center justify-center text-white font-bold active:scale-90 transition-all" style={{ background: 'rgba(255,255,255,0.06)' }}>−</button>
@@ -520,11 +467,9 @@ function ProductForm({ form, setForm, onSubmit, onBack, lookupData }) {
             <button onClick={() => set('quantity', form.quantity + 1)} className="w-9 h-9 rounded-xl flex items-center justify-center font-bold active:scale-90 transition-all" style={{ background: 'rgba(0,230,118,0.12)', color: '#00E676' }}>+</button>
           </div>
         </Field>
-
         <Field label="Ghi chú">
           <textarea value={form.notes} onChange={e => set('notes', e.target.value)} placeholder="Ghi chú thêm..." rows={3} className={`${inputCls} resize-none`} />
         </Field>
-
         <button
           onClick={onSubmit}
           disabled={!isValid}
