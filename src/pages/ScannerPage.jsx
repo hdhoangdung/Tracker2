@@ -11,7 +11,7 @@
  */
 
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { ArrowLeft, Keyboard, CheckCircle, Package, AlertCircle, ScanLine } from 'lucide-react';
+import { ArrowLeft, Keyboard, CheckCircle, Package, AlertCircle } from 'lucide-react';
 import { scanImageData } from '@undecaf/zbar-wasm';
 import { lookupBarcode } from '../services/barcodeApiService';
 import { useProducts } from '../context/ProductContext';
@@ -54,20 +54,30 @@ function parseGS1Dates(raw) {
   return result;
 }
 
-// ─── Camera open — lowest usable resolution for max ZBar speed ─────────
+// ─── Camera open — balances resolution vs ZBar speed ─────────────────
 async function openCamera() {
-  // Max 480×360 forces camera to its lowest video mode.
-  // On iPhone 11 Pro Max this typically delivers 480×360 or 640×480.
-  // ZBar can detect barcodes reliably down to ~200px wide — this is plenty.
+  // 640×480 (VGA) gives enough detail for EAN-13/GS1 while keeping
+  // pixel count low enough for ZBar WASM to process in ~15-25ms.
+  // `ideal` (not `exact`) lets iOS Safari fall back gracefully.
   const constraints = {
     video: {
-      facingMode: { exact: 'environment' },
-      width:  { max: 480, ideal: 320 },
-      height: { max: 360, ideal: 240 },
+      facingMode: { ideal: 'environment' },
+      width:  { min: 480, ideal: 640, max: 1280 },
+      height: { min: 360, ideal: 480, max: 720 },
     },
     audio: false,
   };
-  return navigator.mediaDevices.getUserMedia(constraints);
+  try {
+    return await navigator.mediaDevices.getUserMedia(constraints);
+  } catch (e) {
+    // Fallback: drop `ideal` facingMode in case OverconstrainedError
+    console.warn('[Scanner] First camera attempt failed:', e.message);
+    const fallback = {
+      video: { facingMode: 'environment', width: { ideal: 640 }, height: { ideal: 480 } },
+      audio: false,
+    };
+    return navigator.mediaDevices.getUserMedia(fallback);
+  }
 }
 
 // ─── Main component ────────────────────────────────────────────────────
@@ -133,9 +143,10 @@ export function ScannerPage({ onBack, onNavigate }) {
             const vh = video.videoHeight;
             if (!vw || !vh) return;
 
-            // Crop to scan box region: centre 75% × 45%
-            const cropW = Math.round(vw * 0.75);
-            const cropH = Math.round(vh * 0.45);
+            // Crop to scan box region: centre 85% × 60%
+            // Larger crop = barcode more likely to be inside
+            const cropW = Math.round(vw * 0.85);
+            const cropH = Math.round(vh * 0.60);
             const cropX = Math.round((vw - cropW) / 2);
             const cropY = Math.round((vh - cropH) / 2);
 
@@ -150,7 +161,7 @@ export function ScannerPage({ onBack, onNavigate }) {
 
             ctx.drawImage(video, cropX, cropY, cropW, cropH, 0, 0, cropW, cropH);
             const imageData = ctx.getImageData(0, 0, cropW, cropH);
-            const symbols   = await scanImageData(imageData);
+            const symbols = await scanImageData(imageData);
 
             if (symbols.length > 0 && activeRef.current) {
               const code = symbols[0].decode();
@@ -163,7 +174,11 @@ export function ScannerPage({ onBack, onNavigate }) {
                 return;
               }
             }
-          } catch { /* skip frame */ }
+          } catch (err) {
+            if (import.meta.env.DEV) {
+              console.warn('[Scanner] scan error:', err);
+            }
+          }
         };
 
         // Start scanning immediately (no artificial delay)
